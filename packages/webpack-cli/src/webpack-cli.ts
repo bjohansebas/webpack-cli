@@ -1629,7 +1629,6 @@ class WebpackCLI {
       action: async (entries: string[], options: CommanderArgs, cmd) => {
         const { webpack, webpackOptions, devServerOptions } = cmd.context;
         const webpackCLIOptions: Options = { webpack, isWatchingLikeCommand: true };
-        const devServerCLIOptions: CommanderArgs = {};
 
         for (const optionName in options) {
           const kebabedOption = this.toKebabCase(optionName);
@@ -1639,8 +1638,6 @@ class WebpackCLI {
 
           if (isBuiltInOption) {
             webpackCLIOptions[optionName as keyof Options] = options[optionName];
-          } else {
-            devServerCLIOptions[optionName] = options[optionName];
           }
         }
 
@@ -1653,28 +1650,27 @@ class WebpackCLI {
           env: { WEBPACK_SERVE: true, ...options.env },
         };
 
+        webpackCLIOptions.watch = true;
+
         const compiler = await this.createCompiler(webpackCLIOptions);
 
         if (!compiler) {
           return;
         }
 
-        type DevServerConstructor = typeof import("webpack-dev-server");
-
-        const DevServer: DevServerConstructor = cmd.context.devServer;
-        const servers: InstanceType<DevServerConstructor>[] = [];
-
-        if (this.#needWatchStdin(compiler)) {
-          process.stdin.on("end", () => {
-            Promise.all(servers.map((server) => server.stop())).then(() => {
-              process.exit(0);
-            });
-          });
-          process.stdin.resume();
+        interface DevServerPlugin {
+          new (options: DevServerConfiguration): { apply(compiler: Compiler): void };
+          schema: Parameters<(typeof webpack)["cli"]["getArguments"]>[0];
         }
 
-        const compilers = this.isMultipleCompiler(compiler) ? compiler.compilers : [compiler];
-        const possibleCompilers = compilers.filter((compiler) => compiler.options.devServer);
+        const DevServer = cmd.context.devServer as unknown as DevServerPlugin;
+
+        const compilers: Compiler[] = this.isMultipleCompiler(compiler)
+          ? compiler.compilers
+          : [compiler];
+        const possibleCompilers = compilers.filter(
+          (compiler: Compiler) => compiler.options.devServer,
+        );
         const compilersForDevServer =
           possibleCompilers.length > 0 ? possibleCompilers : [compilers[0]];
         const usedPorts: number[] = [];
@@ -1720,26 +1716,36 @@ class WebpackCLI {
             usedPorts.push(portNumber);
           }
 
-          try {
-            const server = new DevServer(devServerConfiguration, compiler);
-
-            await server.start();
-
-            servers.push(server as unknown as InstanceType<DevServerConstructor>);
-          } catch (error) {
-            if (this.isValidationError(error as Error)) {
-              this.logger.error((error as Error).message);
-            } else {
-              this.logger.error(error);
-            }
-
-            process.exit(2);
-          }
+          new DevServer(devServerConfiguration).apply(compilerForDevServer);
         }
 
-        if (servers.length === 0) {
-          this.logger.error("No dev server configurations to run");
-          process.exit(2);
+        if (this.#needWatchStdin(compiler)) {
+          process.stdin.on("end", () => {
+            compiler.close(() => {
+              process.exit(0);
+            });
+          });
+          process.stdin.resume();
+        }
+
+        const watchCallback = (error: Error | null, stats?: Stats | MultiStats): void => {
+          if (error) {
+            this.logger.error(error);
+            process.exit(2);
+          }
+
+          if (stats && (stats.hasErrors() || (options.failOnWarnings && stats.hasWarnings()))) {
+            process.exitCode = 1;
+          }
+        };
+
+        if (this.isMultipleCompiler(compiler)) {
+          compiler.watch(
+            compiler.compilers.map((child: Compiler) => child.options.watchOptions || {}),
+            watchCallback,
+          );
+        } else {
+          compiler.watch(compiler.options.watchOptions || {}, watchCallback);
         }
       },
     },
@@ -1953,7 +1959,7 @@ class WebpackCLI {
 
   async run(args: readonly string[], parseOptions: ParseOptions) {
     // Default `--color` and `--no-color` options
-    // eslint-disable-next-line @typescript-eslint/no-this-alias
+
     const self: WebpackCLI = this;
 
     // Register own exit
